@@ -2249,7 +2249,7 @@ LAYERS = {"page": 0, "side": 0, "toast": 1, "modal": 2, "tour": 3, "splash": 4}
 
 class Hit:
     __slots__ = ("x0", "y0", "x1", "y1", "layer", "owner", "click", "enter", "leave", "press",
-                 "release", "cursor", "scroll", "enabled")
+                 "release", "cursor", "scroll", "enabled", "drag")
 
 
 class HitMap:
@@ -2261,20 +2261,28 @@ class HitMap:
         self.pressed = None
         self.block = 0
         self._cursor = ""
+        self.press_xy = (0, 0)
         cv = self.cv
         cv.bind("<Motion>", lambda e: self.update(e.x, e.y))
-        cv.bind("<Leave>", lambda e: self._set_hover(None))
+        cv.bind("<Leave>", lambda e: self._set_hover(None) if self.pressed is None else None)
         cv.bind("<ButtonPress-1>", self._press)
         cv.bind("<ButtonRelease-1>", self._release)
+        cv.bind("<B1-Motion>", self._drag)
 
     def add(self, x0, y0, x1, y1, click=None, enter=None, leave=None, layer="page", owner=None,
-            cursor="hand2", scroll=None, press=None, release=None):
+            cursor="hand2", scroll=None, press=None, release=None, drag=None):
         h = Hit()
         h.x0, h.y0, h.x1, h.y1 = x0, y0, x1, y1
         h.layer, h.owner, h.click, h.enter, h.leave = layer, owner, click, enter, leave
         h.press, h.release, h.cursor, h.scroll, h.enabled = press, release, cursor, scroll, True
+        h.drag = drag
         self.hits.append(h)
         return h
+
+    def _drag(self, e):
+        h = self.pressed
+        if h is not None and h.drag:
+            h.drag(e.x, e.y)
 
     def remove(self, hit):
         try:
@@ -2345,6 +2353,7 @@ class HitMap:
     def _press(self, e):
         h = self.find(e.x, e.y)
         self.pressed = h
+        self.press_xy = (e.x, e.y)
         if h is not None and h.press:
             h.press()
 
@@ -2706,10 +2715,48 @@ class ScrollArea:
         self.content = 0
         self.thumb = None
         self._key = new_tag("sc")
+        self._wide = False
+        self._grab = None
         app.scroll_areas.append(self)
+        # the scroll bar can be dragged, and clicking its track jumps a page
+        P = app.px
+        app.hits.add(x1 - P(16), y0, x1 + P(2), y1, owner=owner, cursor="",
+                     press=self._track_press, release=self._track_release, drag=self._track_drag,
+                     enter=lambda: self._hover_thumb(True), leave=lambda: self._hover_thumb(False))
 
     def contains(self, x, y):
         return self.x0 <= x < self.x1 and self.y0 <= y < self.y1
+
+    def _thumb_geometry(self):
+        view = self.y1 - self.y0
+        th = max(self.app.px(36), view * view / max(1.0, self.content))
+        ty = self.y0 + (view - th) * (self.offset / self.max_offset() if self.max_offset() else 0)
+        return view, th, ty
+
+    def _hover_thumb(self, on):
+        self._wide = on or self._grab is not None
+        self._draw_thumb()
+
+    def _track_press(self):
+        if self.max_offset() <= 0:
+            return
+        y = self.app.hits.press_xy[1]
+        view, th, ty = self._thumb_geometry()
+        if ty <= y <= ty + th:
+            self._grab = y - ty  # start dragging the thumb
+        else:
+            self.scroll_by((view * 0.9) * (1 if y > ty else -1))
+
+    def _track_drag(self, x, y):
+        if self._grab is None:
+            return
+        view, th, _ = self._thumb_geometry()
+        k = clamp((y - self._grab - self.y0) / max(1.0, view - th))
+        self.scroll_to(k * self.max_offset(), animate=False)
+
+    def _track_release(self):
+        self._grab = None
+        self._draw_thumb()
 
     def max_offset(self):
         return max(0.0, self.content - (self.y1 - self.y0))
@@ -2748,11 +2795,12 @@ class ScrollArea:
         view = self.y1 - self.y0
         if self.content <= view + 1:
             return
-        th = max(P(36), view * view / self.content)
-        ty = self.y0 + (view - th) * (self.offset / self.max_offset())
-        x = self.x1 - P(3)
-        self.thumb = self.cv.create_line(x, ty + P(3), x, ty + th - P(3), width=P(4), capstyle="round",
-                                         fill=c.line2, tags=(self.owner.tag, "thumb"))
+        view, th, ty = self._thumb_geometry()
+        wide = self._wide or self._grab is not None
+        x = self.x1 - P(5 if wide else 3)
+        self.thumb = self.cv.create_line(x, ty + P(3), x, ty + th - P(3), width=P(8 if wide else 4),
+                                         capstyle="round", fill=c.faint if wide else c.line2,
+                                         tags=(self.owner.tag, "thumb"))
         self.cv.tag_raise(self.thumb)
 
     def destroy(self):
@@ -3878,7 +3926,7 @@ class RulesPage(Page):
             y += rh + gap
         y += P(4)
         self.image(x0, y, app.gfx.badge("info", P(28), c.dim, c.card2, radius=P(9)), tags=(lt,))
-        self.text(x0 + P(38), y + P(14), "If a file type is listed in two rules, the rule higher up wins. "
+        self.text(x0 + P(38), y + P(14), "Click a rule to add file types with  +  or remove them with  × . "
                   "Files that are already sorted stay where they are.", "small", c.dim, anchor="w", tags=(lt,))
         y += P(44)
         self.masks(list_top, y1 - P(10))
@@ -4251,16 +4299,20 @@ GUIDE = [
          ("shot", "rules"),
          ("p", "The **Rules** page lists every folder with its file types. Use the switch on the right to turn a "
                "rule on or off. While a rule is off, its files stay where they land."),
-         ("steps", ["To edit a rule, click its row (or the pencil button).",
-                    "Change the **Folder name**, the **File types** (separate them with spaces, for example  "
-                    "jpg png gif), the **Colour** and the **Icon**.",
-                    "Click **Save rule**."]),
-         ("p", "To add your own rule, click **New rule**, type a folder name (for example Ebooks), add file types "
-               "(for example epub mobi) and click **Save rule**. New rules are placed at the top of the list, so "
-               "they win over the built-in rules."),
+         ("p", "Each file type of a rule is shown as a small coloured chip, like **.jpg**. Files that end in that "
+               "type are sorted into the rule’s folder automatically."),
+         ("steps", ["To change a rule, click its row (or the pencil button).",
+                    "To add a file type, click **+ Add file type**, type it (for example  jpg ) and press "
+                    "**Enter** or click **Add**. It appears as a new chip straight away, and TiDY confirms where "
+                    "those files will go.",
+                    "To remove a file type, click the **×** on its chip.",
+                    "You can also rename the folder and pick a **Colour** and an **Icon**. Then click **Save "
+                    "rule**."]),
+         ("p", "To make your own folder, click **New rule**, type a folder name (for example Ebooks), add its file "
+               "types (for example epub and mobi) and click **Save rule**."),
          ("shot", "editor"),
-         ("bullets", ["If a file type appears in two rules, the rule higher in the list wins. TiDY warns you when "
-                      "that happens.",
+         ("bullets", ["A file type belongs to one folder only. If you add a type that another rule already has, "
+                      "TiDY moves it to this rule and tells you so.",
                       "Rules you added can be deleted (the message that appears has an **Undo** button). "
                       "Built-in rules can only be switched off.",
                       "**Reset** brings back the original eight rules.",
@@ -4621,7 +4673,7 @@ class Modal:
 
     def __init__(self, app, w, h):
         self.app, self.cv = app, app.cv
-        c, P = app.c, app.px
+        P = app.px
         self.tag = new_tag("modal")
         self.entries = []
         self.widgets = []
@@ -4629,21 +4681,25 @@ class Modal:
         app.modal = self
         app.hits.block = LAYERS[self.layer]
         app.hits._set_hover(None)
-        W, H = self.cv.winfo_width(), self.cv.winfo_height()
         self.w, self.h = P(w), P(h)
+        self._bind = app.root.bind("<Escape>", lambda e: self.close(), add="+")
+        self._draw(animate=True)
+
+    def _draw(self, animate):
+        app, c, P = self.app, self.app.c, self.app.px
+        W, H = self.cv.winfo_width(), self.cv.winfo_height()
         self.x = (W - self.w) // 2
-        self.y = (H - self.h) // 2
+        self.y = max(P(8), (H - self.h) // 2)
         tg = (self.tag, "modal")
         self.cv.create_image(0, 0, anchor="nw", image=app.gfx.overlay(W, H, c.overlay, c.overlay_a), tags=tg)
         app.hits.add(0, 0, W, H, click=self.close, layer=self.layer, owner=self, cursor="")
         Card(app, self.x, self.y, self.w, self.h, P(22), c.card, c.line2 if c.dark else None, tg, shadow=True,
              shadow_alpha=0.2, blur=P(22))
         app.hits.add(self.x, self.y, self.x + self.w, self.y + self.h, layer=self.layer, owner=self, cursor="")
-        self._bind = app.root.bind("<Escape>", lambda e: self.close(), add="+")
         self.build()
         self.cv.tag_raise(self.tag)
         app.raise_overlays()
-        if app.anim.enabled:
+        if animate and app.anim.enabled:
             off = [P(26)]
             self.cv.move(self.tag + "_body", 0, off[0])
 
@@ -4688,6 +4744,27 @@ class Modal:
 
     def build(self):
         pass
+
+    def redraw(self, h=None):
+        """Lay the dialog out again in place (for example after it grew)."""
+        for e in self.entries:
+            try:
+                e.destroy()
+            except tk.TclError:
+                pass
+        self.entries = []
+        for b in self.widgets:
+            try:
+                b._hide_tip()
+            except Exception:
+                pass
+        self.widgets = []
+        self.app.hits.remove_owner(self)
+        self.cv.delete(self.tag)
+        if h is not None:
+            self.h = self.app.px(h)
+        self._draw(animate=False)
+        self.app.hits.refresh()
 
     def close(self):
         if self.app.modal is not self:
@@ -4745,92 +4822,321 @@ class Confirm(Modal):
 
 
 class RuleEditor(Modal):
+    """Edit or create a rule.  File types are shown as chips: click "+ Add file
+    type", type an extension like jpg, press Enter - and it becomes a chip.
+    Click a chip's x to remove it."""
+
+    WIDTH = 720
+    CHIP_H = 30
+
     def __init__(self, app, rule):
+        self.app = app  # needed by _height() before Modal sets everything up
         self.rule = rule
         self.is_new = rule is None
         self.catch = bool(rule and rule.get("catch_all"))
         base = rule or {"name": "", "exts": [], "icon": "folder", "color": random.choice(PALETTE_ORDER)}
+        self.base = base
         self.color = base.get("color", "slate")
         self.icon = base.get("icon", "folder")
-        self.base = base
-        super().__init__(app, 560, 478 if not self.catch else 400)
+        self.name_text = base.get("name", "")
+        self.exts = list(base.get("exts", []))
+        self.adding = self.is_new and not self.catch
+        self.add_text = ""
+        self.note = None
+        self.fresh = None
+        self.focus = "name"
+        self.name_entry = self.add_entry = None
+        self.compact = False
+        super().__init__(app, self.WIDTH, self._height())
 
+    # ---- layout ----------------------------------------------------------------------------------
+    def _chip_w(self, ext):
+        return self.app.fonts["small_b"].measure("." + ext) + self.app.px(14 + 24)
+
+    def _chips_layout(self):
+        """Positions (relative to the chip box) of every chip and of the add control."""
+        P = self.app.px
+        inner = P(self.WIDTH - 56 - 24)
+        h, gap = P(self.CHIP_H), P(8)
+        items = [("chip", e, self._chip_w(e)) for e in self.exts]
+        add_w = P(260) if self.adding else self.app.fonts["small_b"].measure("Add file type") + P(52)
+        items.append(("add", None, add_w))
+        x = y = 0
+        placed = []
+        for kind, ext, w in items:
+            if x and x + w > inner:
+                x, y = 0, y + h + gap
+            placed.append((kind, ext, x, y, w))
+            x += w + gap
+        return placed, y + h + 2 * P(12)
+
+    def _height(self):
+        """Dialog height in design units (mirrors the layout in build)."""
+        S = self.app.S
+        box = 40 if self.catch else self._chips_layout()[1] / S
+        total = 184 + box + 38 + (24 + 26 + 22) + (0 if self.compact else 24 + 36) + 24 + 40 + 26
+        if not self.compact and total > self.app.cv.winfo_height() / S - 16:
+            self.compact = True  # small window: leave out the icon picker row
+            return self._height()
+        return total
+
+    def _sync(self):
+        """Remember what was typed before the dialog is laid out again."""
+        if self.name_entry is not None:
+            try:
+                self.name_text = self.name_entry.get()
+            except tk.TclError:
+                pass
+        if self.add_entry is not None:
+            try:
+                self.add_text = self.add_entry.get()
+            except tk.TclError:
+                pass
+
+    def refresh(self):
+        self._sync()
+        self.compact = False
+        self.redraw(self._height())
+
+    # ---- drawing --------------------------------------------------------------------------------------
     def build(self):
         app, cv, c, P = self.app, self.cv, self.app.c, self.app.px
+        glyph, tint = app.palette_colors(self.color)
         title = "New rule" if self.is_new else "Edit “%s”" % self.base["name"]
         self.text(P(28), P(28), title, "h1", c.text)
         self.button(self.w - P(20), P(22), "", self.close, kind="ghost", icon="x", w=36, h=36, anchor="ne")
         y = P(80)
         self.text(P(28), y, "Folder name", "small_b", c.dim)
-        self.name_entry = self.entry(P(28), y + P(22), self.w - P(56), self.base.get("name", ""))
-        y += P(78)
-        if not self.catch:
-            self.text(P(28), y, "File types", "small_b", c.dim)
-            self.text(self.w - P(28), y, "separate with spaces, e.g.  jpg png gif", "small", c.faint, anchor="ne")
-            self.ext_entry = self.entry(P(28), y + P(22), self.w - P(56), " ".join(self.base.get("exts", [])))
-            y += P(78)
+        self.text(self.w - P(28), y, "the sub-folder files are moved into", "small", c.faint, anchor="ne")
+        self.name_entry = self.entry(P(28), y + P(22), self.w - P(56), self.name_text)
+        self.name_entry.bind("<FocusIn>", lambda e: setattr(self, "focus", "name"), add="+")
+        y += P(80)
+        self.text(P(28), y, "File types", "small_b", c.dim)
+        if self.catch:
+            self.text(P(28), y + P(26), "This rule catches every file type that no other rule lists.", "body",
+                      c.dim)
+            y += P(24) + P(40)
         else:
-            self.text(P(28), y, "This rule catches every file type that no other rule lists.", "small", c.dim)
-            y += P(30)
+            self.text(self.w - P(28), y, "click  +  to add a type,  ×  to remove one", "small", c.faint,
+                      anchor="ne")
+            y = self._draw_chips(P(28), y + P(24), glyph, tint)
+        self.note_item = self.text(P(28), y + P(8), "", "small_b", c.dim)
+        self._show_note()
+        y += P(38)
         self.text(P(28), y, "Colour", "small_b", c.dim)
         y += P(24)
         self.swatches = {}
         for i, name in enumerate(PALETTE_ORDER):
-            sx = self.x + P(28) + i * P(36)
-            sy = self.y + y
+            sx, sy = self.x + P(28) + i * P(36), self.y + y
             light, dark = PALETTE[name]
             col = dark if c.dark else light
-            ring = cv.create_oval(sx - P(3), sy - P(3), sx + P(29), sy + P(29), outline=c.card, width=P(2),
-                                  tags=self.T())
+            ring = cv.create_oval(sx - P(3), sy - P(3), sx + P(29), sy + P(29), width=P(2), tags=self.T(),
+                                  outline=col if name == self.color else c.card)
             cv.create_image(sx, sy, anchor="nw", image=app.gfx.disc(P(26), col), tags=self.T())
-            self.swatches[name] = (ring, col)
+            self.swatches[name] = ring
             app.hits.add(sx, sy, sx + P(26), sy + P(26), click=lambda n=name: self.pick_color(n), layer="modal",
                          owner=self)
-        y += P(46)
-        self.text(P(28), y, "Icon", "small_b", c.dim)
-        y += P(24)
-        self.icon_items = {}
-        for i, name in enumerate(RULE_ICONS):
-            ix = self.x + P(28) + i * P(42)
-            iy = self.y + y
-            item = cv.create_image(ix, iy, anchor="nw", tags=self.T())
-            self.icon_items[name] = item
-            app.hits.add(ix, iy, ix + P(36), iy + P(36), click=lambda n=name: self.pick_icon(n), layer="modal",
-                         owner=self)
-        self.pick_color(self.color)
-        y += P(52)
-        self.error = self.text(P(28), y, "", "small_b", c.bad)
+        y += P(26) + P(22)
+        if not self.compact:
+            self.text(P(28), y, "Icon", "small_b", c.dim)
+            y += P(24)
+            for i, name in enumerate(RULE_ICONS):
+                ix, iy = self.x + P(28) + i * P(42), self.y + y
+                on = name == self.icon
+                cv.create_image(ix, iy, anchor="nw", tags=self.T(), image=app.gfx.badge(
+                    name, P(36), glyph if on else c.dim, tint if on else c.card2, radius=P(11)))
+                app.hits.add(ix, iy, ix + P(36), iy + P(36), click=lambda n=name: self.pick_icon(n),
+                             layer="modal", owner=self)
         if not self.is_new and not self.rule.get("builtin"):
-            self.button(P(28), self.h - P(26), "Delete", self.delete, kind="danger", icon="trash", h=40,
+            self.button(P(28), self.h - P(26), "Delete rule", self.delete, kind="danger", icon="trash", h=40,
                         anchor="sw")
         save = self.button(self.w - P(28), self.h - P(26), "Save rule", self.save, kind="primary", icon="check",
                            h=40, anchor="se")
         self.button(save.x - self.x - P(10), self.h - P(26), "Cancel", self.close, kind="secondary", h=40,
                     anchor="se")
         app.root.bind("<Return>", lambda e: self.save())
-        self.name_entry.focus_set()
-        self.name_entry.icursor("end")
+        target = self.add_entry if (self.focus == "add" and self.add_entry is not None) else self.name_entry
+        target.focus_set()
+        target.icursor("end")
+        if self.fresh:
+            self._pop_fresh()
+
+    def _draw_chips(self, x, y, glyph, tint):
+        """The chip box: one chip per file type plus the add button (or the add box)."""
+        app, cv, c, P, F = self.app, self.cv, self.app.c, self.app.px, self.app.fonts
+        placed, box_h = self._chips_layout()
+        bx, by = self.x + x, self.y + y
+        Card(app, bx, by, self.w - P(56), box_h, P(16), c.input, c.line2, self.T())
+        pad = P(12)
+        h = P(self.CHIP_H)
+        self.add_entry = None
+        for kind, ext, cx, cy, w in placed:
+            X, Y = bx + pad + cx, by + pad + cy
+            if kind == "chip":
+                tags = self.T() + ((self.tag + "_fresh",) if ext == self.fresh else ())
+                chip = cv.create_image(X, Y, anchor="nw", image=app.gfx.rrect(w, h, h / 2.0, tint), tags=tags)
+                cv.create_text(X + P(14), Y + h / 2, text="." + ext, anchor="w", font=F["small_b"], fill=glyph,
+                               tags=tags)
+                cross = cv.create_image(X + w - P(15), Y + h / 2, image=app.gfx.icon("x", P(13), glyph), tags=tags)
+                app.hits.add(X, Y, X + w - P(26), Y + h, layer="modal", owner=self,
+                             click=lambda e=ext: self.explain(e),
+                             enter=lambda i=chip, ww=w: cv.itemconfigure(i, image=app.gfx.rrect(
+                                 ww, h, h / 2.0, tint, mix(tint, glyph, 0.55))),
+                             leave=lambda i=chip, ww=w: cv.itemconfigure(i, image=app.gfx.rrect(ww, h, h / 2.0, tint)))
+                app.hits.add(X + w - P(26), Y, X + w, Y + h, layer="modal", owner=self,
+                             click=lambda e=ext: self.remove(e),
+                             enter=lambda i=cross: cv.itemconfigure(i, image=app.gfx.icon("x", P(13), c.bad)),
+                             leave=lambda i=cross: cv.itemconfigure(i, image=app.gfx.icon("x", P(13), glyph)))
+            elif not self.adding:
+                add = cv.create_image(X, Y, anchor="nw", tags=self.T(),
+                                      image=app.gfx.rrect(w, h, h / 2.0, c.card, mix(c.line2, c.accent, 0.5)))
+                cv.create_image(X + P(18), Y + h / 2, image=app.gfx.icon("plus", P(15), c.accent_ink),
+                                tags=self.T())
+                cv.create_text(X + P(32), Y + h / 2, text="Add file type", anchor="w", font=F["small_b"],
+                               fill=c.accent_ink, tags=self.T())
+                app.hits.add(X, Y, X + w, Y + h, layer="modal", owner=self, click=self.start_adding,
+                             enter=lambda i=add, ww=w: cv.itemconfigure(i, image=app.gfx.rrect(
+                                 ww, h, h / 2.0, c.accent_soft, c.accent)),
+                             leave=lambda i=add, ww=w: cv.itemconfigure(i, image=app.gfx.rrect(
+                                 ww, h, h / 2.0, c.card, mix(c.line2, c.accent, 0.5))))
+            else:
+                ew = w - P(70)
+                cv.create_image(X, Y, anchor="nw", tags=self.T(), image=app.gfx.rrect(ew, h, h / 2.0, c.card, c.accent))
+                cv.create_text(X + P(14), Y + h / 2, text=".", anchor="w", font=F["body_b"], fill=c.faint,
+                               tags=self.T())
+                e = tk.Entry(cv, relief="flat", bd=0, highlightthickness=0, bg=c.card, fg=c.text,
+                             insertbackground=c.text, font=F["small_b"], selectbackground=c.accent,
+                             selectforeground="#FFFFFF")
+                e.insert(0, self.add_text)
+                cv.create_window(X + P(24), Y + h / 2, anchor="w", window=e, width=ew - P(38), height=P(22),
+                                 tags=self.T())
+                e.bind("<Return>", lambda ev: (self.commit_add(), "break")[1])
+                e.bind("<KP_Enter>", lambda ev: (self.commit_add(), "break")[1])
+                e.bind("<Escape>", lambda ev: (self.stop_adding(), "break")[1])
+                e.bind("<FocusIn>", lambda ev: setattr(self, "focus", "add"), add="+")
+                self.entries.append(e)
+                self.add_entry = e
+                self.button(X - self.x + ew + P(8), Y - self.y, "Add", self.commit_add, kind="primary",
+                            icon="plus", h=self.CHIP_H, w=62, font="small_b")
+        return y + box_h
+
+    def _show_note(self):
+        c = self.app.c
+        if self.note:
+            text, tone = self.note
+        elif self.adding and not self.catch:
+            text, tone = "Type a file type, for example  jpg  or  pdf , and press Enter.", "info"
+        elif not self.exts and not self.catch:
+            text, tone = "No file types yet — click  + Add file type  to add one.", "warn"
+        else:
+            text, tone = "", "info"
+        col = {"good": c.good, "bad": c.bad, "warn": c.warn, "info": c.dim}[tone]
+        self.cv.itemconfigure(self.note_item, text=self.app.fonts.fit("small_b", text, self.w - self.app.px(56)),
+                              fill=col)
+
+    def _pop_fresh(self):
+        tag = self.tag + "_fresh"
+        P = self.app.px
+        moved = [0.0]
+
+        def bounce(k):
+            target = -math.sin(math.pi * k) * P(6)
+            self.cv.move(tag, 0, target - moved[0])
+            moved[0] = target
+        self.app.anim.tween(0.4, bounce, ease=ease_out_cubic)
+        self.fresh = None
+
+    # ---- actions --------------------------------------------------------------------------------------------
+    def folder_label(self):
+        name = (self.name_entry.get() if self.name_entry is not None else self.name_text).strip()
+        return "“%s”" % name if name else "this folder"
+
+    def owner_of(self, ext):
+        for other in self.app.settings["rules"]:
+            if other is not self.rule and not other.get("catch_all") and ext in other.get("exts", []):
+                return other
+        return None
+
+    def start_adding(self):
+        self.adding = True
+        self.focus = "add"
+        self.note = None
+        self.refresh()
+
+    def stop_adding(self):
+        self.adding = False
+        self.add_text = ""
+        self.focus = "name"
+        self.note = None
+        self.refresh()
+
+    def commit_add(self):
+        text = self.add_entry.get() if self.add_entry is not None else ""
+        added, problems, invalid = [], [], []
+        for tok in re.split(r"[\s,;]+", text.lower()):
+            tok = tok.strip().lstrip("*").strip(".")
+            if not tok:
+                continue
+            if not re.match(r"^[a-z0-9][a-z0-9_.+!~-]*$", tok):
+                problems.append("“%s” isn't a file type" % tok)
+                invalid.append(tok)
+            elif tok in self.exts:
+                problems.append(".%s is already in this rule" % tok)
+            else:
+                self.exts.append(tok)
+                added.append(tok)
+        self.add_text = ""
+        if self.add_entry is not None:
+            self.add_entry.delete(0, "end")  # ready for the next one
+        if added:
+            self.fresh = added[-1]
+            names = ", ".join("." + a for a in added)
+            moved = [self.owner_of(a) for a in added]
+            moved = sorted(set(o["name"] for o in moved if o))
+            note = "✓ %s files will now be sorted into %s automatically." % (names, self.folder_label())
+            if moved:
+                note += " (Moved out of %s.)" % ", ".join(moved)
+            self.note = (note, "good")
+        elif problems:
+            self.note = ("; ".join(problems) + ".", "bad")
+        else:
+            self.note = None
+        self.focus = "add"
+        self.refresh()
+        return invalid
+
+    def remove(self, ext):
+        if ext in self.exts:
+            self.exts.remove(ext)
+        self.note = ("Removed .%s — those files won't be moved to %s any more." % (ext, self.folder_label()),
+                     "info")
+        self.refresh()
+
+    def explain(self, ext):
+        self.note = ("Files that end in .%s are sorted into %s automatically. Click × to remove it."
+                     % (ext, self.folder_label()), "info")
+        self._sync()
+        self._show_note()
 
     def pick_color(self, name):
-        app, c, P = self.app, self.app.c, self.app.px
         self.color = name
-        for n, (ring, col) in self.swatches.items():
-            self.cv.itemconfigure(ring, outline=col if n == name else c.card)
-        light, dark = PALETTE[name]
-        glyph = dark if c.dark else light
-        tint = mix(c.card, dark, 0.16 if c.dark else 0.2)
-        for n, item in self.icon_items.items():
-            on = n == self.icon
-            self.cv.itemconfigure(item, image=app.gfx.badge(n, P(36), glyph if on else c.dim,
-                                                            tint if on else c.card2, radius=P(11)))
+        self.refresh()
 
     def pick_icon(self, name):
         self.icon = name
-        self.pick_color(self.color)
+        self.refresh()
+
+    def _err(self, msg):
+        self.note = (msg, "bad")
+        self._show_note()
+        return None
 
     def save(self):
         app = self.app
-        name = self.name_entry.get().strip()
+        if self.adding and self.add_entry is not None and self.add_entry.get().strip():
+            if self.commit_add():  # something typed but not added yet - add it first
+                return None  # (only real typos stop the save; duplicates are simply ignored)
+        name = (self.name_entry.get() if self.name_entry is not None else self.name_text).strip()
         bad = '\\/:*?"<>|'
         rules = app.settings["rules"]
         if not name:
@@ -4839,42 +5145,37 @@ class RuleEditor(Modal):
             return self._err("Folder names can't contain  \\ / : * ? \" < > |")
         if any(r is not self.rule and r["name"].lower() == name.lower() for r in rules):
             return self._err("Another rule already uses a folder with that name.")
-        exts = []
-        if not self.catch:
-            for tok in re.split(r"[\s,;]+", self.ext_entry.get().lower()):
-                tok = tok.strip().lstrip("*").strip(".")
-                if tok and re.match(r"^[a-z0-9][a-z0-9_.+!~-]*$", tok) and tok not in exts:
-                    exts.append(tok)
-            if not exts:
-                return self._err("Add at least one file type, like  pdf  or  mp3.")
+        if not self.catch and not self.exts:
+            return self._err("Add at least one file type — click  + Add file type.")
+        moved = []
+        if not self.catch:  # a file type belongs to one folder only: take it away from other rules
+            for other in rules:
+                if other is self.rule or other.get("catch_all"):
+                    continue
+                taken = [e for e in other.get("exts", []) if e in self.exts]
+                if taken:
+                    other["exts"] = [e for e in other["exts"] if e not in self.exts]
+                    moved.append(other["name"])
         if self.is_new:
-            rule = {"id": "rule%x" % random.randint(0x10000, 0xFFFFFF), "name": name, "exts": exts,
+            rule = {"id": "rule%x" % random.randint(0x10000, 0xFFFFFF), "name": name, "exts": list(self.exts),
                     "icon": self.icon, "color": self.color, "on": True, "builtin": False, "catch_all": False}
-            rules.insert(0, rule)  # new rules go first, so they win
+            rules.insert(0, rule)
         else:
             rule = self.rule
             rule.update(name=name, icon=self.icon, color=self.color)
             if not self.catch:
-                rule["exts"] = exts
-        taken = []
-        for other in rules:
-            if other is rule:
-                break
-            taken += [e for e in exts if e in other.get("exts", [])]
+                rule["exts"] = list(self.exts)
         self.close()
         app.rules_changed()
-        if taken:
-            app.toasts.show("Saved - with a note", "%s also in an earlier rule, which wins." % (
-                ", ".join("." + t for t in taken[:3]) + (" is" if len(taken) == 1 else " are")), icon="info",
-                glyph=app.c.warn, tint=app.c.warn_soft)
+        glyph, tint = app.rule_colors(rule)
+        if self.catch:
+            sub = "Files that match no other rule go to “%s”." % name
         else:
-            glyph, tint = app.rule_colors(rule)
-            app.toasts.show("Rule saved", "New %s files will go to “%s”." % (
-                "matching" if not self.catch else "unknown", name), icon=rule["icon"], glyph=glyph, tint=tint)
-
-    def _err(self, msg):
-        self.cv.itemconfigure(self.error, text=msg)
-        return None
+            shown = ", ".join("." + e for e in rule["exts"][:4]) + (" …" if len(rule["exts"]) > 4 else "")
+            sub = "%s files go to “%s”." % (shown, name)
+            if moved:
+                sub += " (Moved from %s.)" % ", ".join(moved)
+        app.toasts.show("Rule saved", sub, icon=rule.get("icon", "folder"), glyph=glyph, tint=tint)
 
     def delete(self):
         app = self.app
@@ -4889,6 +5190,7 @@ class RuleEditor(Modal):
             app.rules_changed()
         app.toasts.show("Rule deleted", "“%s” won't be used any more." % rule["name"], icon="trash",
                         glyph=app.c.bad, tint=app.c.bad_soft, action=("Undo", undo))
+
 
 # =============================================================================
 #  The tutorial: six animated steps
@@ -5435,6 +5737,10 @@ class App:
         self.cv.bind("<MouseWheel>", self._wheel)
         self.cv.bind("<Button-4>", lambda e: self._wheel(e, -120))
         self.cv.bind("<Button-5>", lambda e: self._wheel(e, 120))
+        try:
+            self.cv.bind("<TouchpadScroll>", self._touchpad)  # Tk 9+: laptop touchpads
+        except tk.TclError:
+            pass  # older Tk sends touchpad scrolling as normal mouse-wheel events
         self.cv.bind("<Configure>", self._configure)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.rebind_keys()
@@ -5507,9 +5813,10 @@ class App:
             root.iconphoto(True, *icons)
         except tk.TclError:
             pass
-        root.minsize(P(1000), P(640))
         area = work_area() or (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
         aw, ah = area[2] - area[0], area[3] - area[1]
+        # never ask for a window bigger than the screen (small laptops, big zoom levels)
+        root.minsize(min(P(1000), aw - P(20)), min(P(640), ah - P(50)))
         w = min(P(1180), aw - P(40))
         h = min(P(770), ah - P(70))
         geo = self.settings.get("geometry")
@@ -5570,6 +5877,9 @@ class App:
         for i, name in enumerate(("home", "activity", "rules", "settings", "guide")):
             r.bind("<Control-Key-%d>" % (i + 1), lambda e, n=name: self.show_page(n) if not (
                 self.tour or self.modal) else None)
+        for seq, kind in (("<Up>", "up"), ("<Down>", "down"), ("<Prior>", "pgup"), ("<Next>", "pgdn"),
+                          ("<Home>", "home"), ("<End>", "end")):
+            r.bind(seq, lambda e, k=kind: self._key_scroll(k))
 
     def _key(self, key):
         if self.splash is not None:
@@ -5589,14 +5899,45 @@ class App:
         elif self.modal is not None and key == "esc":
             self.modal.close()
 
-    def _wheel(self, event, delta=None):
+    def _area_at(self, x=None, y=None):
+        """The scrollable list under the pointer - or the current page's list."""
         if self.hits.block:
+            return None
+        if x is not None:
+            for area in self.scroll_areas:
+                if area.contains(x, y):
+                    return area
+        return getattr(self.page, "area", None)
+
+    def _wheel(self, event, delta=None):
+        area = self._area_at(event.x, event.y)
+        if area is not None:
+            delta = event.delta if delta is None else delta
+            area.scroll_by(-delta / 120.0 * self.px(90))
+
+    def _touchpad(self, event):
+        """Two-finger scrolling on a laptop touchpad (Tk 9 reports it separately)."""
+        area = self._area_at(event.x, event.y)
+        if area is None:
             return
-        delta = event.delta if delta is None else delta
-        for area in self.scroll_areas:
-            if area.contains(event.x, event.y):
-                area.scroll_by(-delta / 120.0 * self.px(90))
-                return
+        low = event.delta & 0xFFFF
+        dy = low if low < 0x8000 else low - 0x10000
+        if dy:
+            area.scroll_by(-dy * self.S * 1.5)
+
+    def _key_scroll(self, kind):
+        if self.modal is not None or self.tour is not None or self.splash is not None:
+            return
+        area = self._area_at()
+        if area is None:
+            return
+        page = (area.y1 - area.y0) * 0.9
+        if kind == "home":
+            area.scroll_to(0)
+        elif kind == "end":
+            area.scroll_to(area.max_offset())
+        else:
+            area.scroll_by({"up": -self.px(70), "down": self.px(70), "pgup": -page, "pgdn": page}[kind])
 
     # ---- pages ----------------------------------------------------------------------------
     def show_page(self, name, animate=True):

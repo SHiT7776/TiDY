@@ -27,7 +27,8 @@ there, Windows sends TiDY a change event, and TiDY moves the file into a sub-fol
 - **Real-time watching** with Windows' own change events (`ReadDirectoryChangesW`), so it uses no CPU while nothing happens
 - **Safe with downloads**: waits until a download (`.crdownload`, `.part`, …) has completely finished
 - **Never deletes or overwrites**: if a name is taken, it saves `photo (1).jpg`; every move can be **undone**
-- **Editable rules**: 8 folders out of the box, plus your own rules, colours and icons
+- **Easy rules**: 8 folders out of the box. Add a file type with **+**, remove it with **×**, or make your own
+  folder with its own colour and icon
 - **Activity history** with *Show in folder* and *Undo*
 - **Runs in the background** in the system tray, with optional pop-ups, a soft chime and *Start with Windows*
 - **Beautiful and simple**: animations, light and dark themes, an animated quick tour and a built-in user guide
